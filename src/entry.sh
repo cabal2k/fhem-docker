@@ -4,8 +4,6 @@
 #    https://raw.githubusercontent.com/JoschaMiddendorf/fhem-docker/master/StartAndInitialize.sh
 
 export FHEM_DIR="/opt/fhem"
-export LOGFILE="${FHEM_DIR}/log/${LOGFILE:-fhem-%Y-%m.log}"
-export PIDFILE="${FHEM_DIR}/log/${PIDFILE:-fhem.pid}"
 export SLEEPINTERVAL=0.5
 export TIMEOUT="${TIMEOUT:-10}"
 export RESTART="${RESTART:-1}"
@@ -20,8 +18,33 @@ export BLUETOOTH_GID="${BLUETOOTH_GID:-6001}"
 export GPIO_GID="${GPIO_GID:-6002}"
 export I2C_GID="${I2C_GID:-6003}"
 
+# determine global logfile
+if [ -z "${LOGFILE}" ]; then
+  if [ "${CONFIGTYPE}" == "configDB" ]; then
+    export LOGFILE="${FHEM_DIR}/./log/fhem-%Y-%m.log"
+  else
+    GLOGFILE=$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global logfile' | cut -d ' ' -f 4)
+    export LOGFILE="${FHEM_DIR}/${GLOGFILE:-./log/fhem-%Y-%m.log}"
+  fi
+else
+  export LOGFILE="${FHEM_DIR}/${LOGFILE}"
+fi
+
+# determine PID file
+if [ -z "${PIDFILE}" ]; then
+  if [ "${CONFIGTYPE}" == "configDB" ]; then
+    export PIDFILE="${FHEM_DIR}/./log/fhem.pid"
+  else
+    GPIDFILE=$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global pidfilename' | cut -d ' ' -f 4)
+    export PIDFILE="${FHEM_DIR}/${GPIDFILE:-./log/fhem.pid}"
+  fi
+else
+  export PIDFILE="${FHEM_DIR}/${PIDFILE}"
+fi
+
 [ ! -f /image_info.EMPTY ] && touch /image_info.EMPTY
 
+# Collect info about container
 ip link add dummy0 type dummy >/dev/null 2>&1
 if [[ $? -eq 0 ]]; then
   echo 1 > /docker.privileged
@@ -29,8 +52,12 @@ if [[ $? -eq 0 ]]; then
 else
   echo 0 > /docker.privileged
 fi
-cat /proc/self/cgroup | grep "memory:" | cut -d "/" -f 3 > /docker.containerid
+cat /proc/self/cgroup | grep "memory:" | cut -d "/" -f 3 > /docker.container.id
+captest --text | grep -P "^Effective:" | cut -d " " -f 2- | sed "s/, /\n/g" | sort | sed ':a;N;$!ba;s/\n/,/g' > /docker.container.cap.e
+captest --text | grep -P "^Permitted:" | cut -d " " -f 2- | sed "s/, /\n/g" | sort | sed ':a;N;$!ba;s/\n/,/g' > /docker.container.cap.p
+captest --text | grep -P "^Inheritable:" | cut -d " " -f 2- | sed "s/, /\n/g" | sort | sed ':a;N;$!ba;s/\n/,/g' > /docker.container.cap.i
 
+# This is a brand new container
 if [ -d "/fhem" ]; then
   echo "Preparing initial start:"
   i=1
@@ -64,7 +91,7 @@ if [ -d "/fhem" ]; then
 
     echo "define DockerImageInfo DockerImageInfo" >> ${FHEM_DIR}/fhem.cfg
     echo "attr DockerImageInfo alias Docker Image Info" >> ${FHEM_DIR}/fhem.cfg
-    echo "attr DockerImageInfo devStateIcon ok:security@green .*:message_attention@red" >> ${FHEM_DIR}/fhem.cfg
+    echo "attr DockerImageInfo devStateIcon ok:security@green Initialized:system_fhem_reboot@orange .*:message_attention@red" >> ${FHEM_DIR}/fhem.cfg
     echo "attr DockerImageInfo group System" >> ${FHEM_DIR}/fhem.cfg
     echo "attr DockerImageInfo icon docker" >> ${FHEM_DIR}/fhem.cfg
     echo "attr DockerImageInfo room System" >> ${FHEM_DIR}/fhem.cfg
@@ -233,23 +260,23 @@ chmod 644 ${FHEM_DIR}/.ssh/id_ed25519.pub ${FHEM_DIR}/.ssh/id_rsa.pub
 (( i++ ))
 
 # Function to print FHEM log in incremental steps to the docker log.
-[ -s "$( date +"$LOGFILE" )" ] && OLDLINES=$( wc -l < "$( date +"$LOGFILE" )" ) || OLDLINES=0
-NEWLINES=$OLDLINES
+[ -s "$( date +"${LOGFILE}" )" ] && OLDLINES=$( wc -l < "$( date +"${LOGFILE}" )" ) || OLDLINES=0
+NEWLINES=${OLDLINES}
 FOUND=false
 function PrintNewLines {
-  if [ -s "$( date +"$LOGFILE" )" ]; then
-  	NEWLINES=$(wc -l < "$(date +"$LOGFILE")")
-  	(( OLDLINES <= NEWLINES )) && LINES=$(( NEWLINES - OLDLINES )) || LINES=$NEWLINES
-  	tail -n "$LINES" "$(date +"$LOGFILE")"
-  	[ -n "$1" ] && grep -q "$1" <(tail -n "$LINES" "$(date +"$LOGFILE")") && FOUND=true || FOUND=false
-  	OLDLINES=$NEWLINES
+  if [ -s "$( date +"${LOGFILE}" )" ]; then
+  	NEWLINES=$(wc -l < "$(date +"${LOGFILE}")")
+  	(( OLDLINES <= NEWLINES )) && LINES=$(( NEWLINES - OLDLINES )) || LINES=${NEWLINES}
+  	tail -n "${LINES}" "$(date +"${LOGFILE}")"
+  	[ -n "$1" ] && grep -q "$1" <(tail -n "$LINES" "$(date +"${LOGFILE}")") && FOUND=true || FOUND=false
+  	OLDLINES=${NEWLINES}
   fi
 }
 
 # Docker stop signal handler
 function StopFHEM {
 	echo -e '\n\nSIGTERM signal received, sending "shutdown" command to FHEM!\n'
-	PID=$(<"$PIDFILE")
+	PID=$(<"${PIDFILE}")
   su - fhem -c "cd "${FHEM_DIR}"; perl fhem.pl 7072 shutdown"
 	echo -e 'Waiting for FHEM process to terminate before stopping container:\n'
 
@@ -280,42 +307,49 @@ function StartFHEM {
 
   # Update system environment
   #
-  echo 'Preparing configuration ...'
 
-  # Mandatory
-  [ -z "$(cat ${FHEM_DIR}/fhem.cfg | grep -P '^define .+ DockerImageInfo.*')" ] && echo "define DockerImageInfo DockerImageInfo" >> ${FHEM_DIR}/fhem.cfg
-  sed -i "s,attr global nofork.*,attr global nofork 0," ${FHEM_DIR}/fhem.cfg
-  [ -z "$(cat ${FHEM_DIR}/fhem.cfg | grep -P '^attr global nofork')" ] && echo "attr global nofork 0" >> ${FHEM_DIR}/fhem.cfg
-  sed -i "s,attr global updateInBackground.*,attr global updateInBackground 1," ${FHEM_DIR}/fhem.cfg
-  [ -z "$(cat ${FHEM_DIR}/fhem.cfg | grep -P '^attr global updateInBackground')" ] && echo "attr global updateInBackground 1" >> ${FHEM_DIR}/fhem.cfg
-  sed -i "s,attr global pidfilename.*,attr global pidfilename .${PIDFILE#${FHEM_DIR}}," ${FHEM_DIR}/fhem.cfg
-  [ -z "$(cat ${FHEM_DIR}/fhem.cfg | grep -P '^attr global pidfilename')" ] && echo "attr global pidfilename .${PIDFILE#${FHEM_DIR}}" >> ${FHEM_DIR}/fhem.cfg
+  if [ "${CONFIGTYPE}" == "configDB" ]; then
+    echo 'configDB detected - skipping automatic config preparation ...'
+  else
+    echo 'Preparing configuration ...'
 
-  ## Find Telnet access details
-  if [ -z "$(cat ${FHEM_DIR}/fhem.cfg | grep -P "^define .* telnet ${TELNETPORT}")" ]; then
-    CUSTOMPORT="$(cat ${FHEM_DIR}/fhem.cfg | grep -P '^define telnetPort telnet ' | cut -d ' ' -f 4)"
-    if [ -z "${CUSTOMPORT}"]; then
-      echo "define telnetPort telnet ${TELNETPORT}" >> ${FHEM_DIR}/fhem.cfg
-    else
-      TELNETPORT=${CUSTOMPORT}
+    # Mandatory
+    [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^define .+ DockerImageInfo.*')" ] && echo "define DockerImageInfo DockerImageInfo" >> ${FHEM_DIR}/${CONFIGTYPE}
+    sed -i "s,attr global nofork.*,attr global nofork 0," ${FHEM_DIR}/${CONFIGTYPE}
+    [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global nofork')" ] && echo "attr global nofork 0" >> ${FHEM_DIR}/${CONFIGTYPE}
+    sed -i "s,attr global updateInBackground.*,attr global updateInBackground 1," ${FHEM_DIR}/${CONFIGTYPE}
+    [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global updateInBackground')" ] && echo "attr global updateInBackground 1" >> ${FHEM_DIR}/${CONFIGTYPE}
+    sed -i "s,attr global logfile.*,attr global logfile ${LOGFILE#${FHEM_DIR}/}," ${FHEM_DIR}/${CONFIGTYPE}
+    [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global logfile')" ] && echo "attr global logfile ${LOGFILE#${FHEM_DIR}/}" >> ${FHEM_DIR}/${CONFIGTYPE}
+    sed -i "s,attr global pidfilename.*,attr global pidfilename ${PIDFILE#${FHEM_DIR}/}," ${FHEM_DIR}/${CONFIGTYPE}
+    [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^attr global pidfilename')" ] && echo "attr global pidfilename ${PIDFILE#${FHEM_DIR}/}" >> ${FHEM_DIR}/${CONFIGTYPE}
+
+    ## Find Telnet access details
+    if [ -z "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P "^define .* telnet ${TELNETPORT}")" ]; then
+      CUSTOMPORT="$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P '^define telnetPort telnet ' | cut -d ' ' -f 4)"
+      if [ -z "${CUSTOMPORT}"]; then
+        echo "define telnetPort telnet ${TELNETPORT}" >> ${FHEM_DIR}/${CONFIGTYPE}
+      else
+        TELNETPORT=${CUSTOMPORT}
+      fi
     fi
-  fi
-  TELNETDEV="$(cat ${FHEM_DIR}/fhem.cfg | grep -P "^define .* telnet ${TELNETPORT}" | cut -d " " -f 2)"
-  TELNETALLOWEDDEV="$(cat ${FHEM_DIR}/fhem.cfg | grep -P "^attr .* validFor .*${TELNETDEV}.*" | cut -d " " -f 2)"
+    TELNETDEV="$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P "^define .* telnet ${TELNETPORT}" | cut -d " " -f 2)"
+    TELNETALLOWEDDEV="$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P "^attr .* validFor .*${TELNETDEV}.*" | cut -d " " -f 2)"
 
-  ## Enforce local telnet access w/o password
-  if [ -n "$(cat ${FHEM_DIR}/fhem.cfg | grep -P "^attr ${TELNETALLOWEDDEV} password.*")" ]; then
-    if [ -n "$(cat ${FHEM_DIR}/fhem.cfg | grep -P "^attr ${TELNETALLOWEDDEV} globalpassword.*")" ]; then
-      echo "  - Removed local password from Telnet allowed device '${TELNETALLOWEDDEV}'"
-      sed -i "/attr ${TELNETALLOWEDDEV} password/d" ${FHEM_DIR}/fhem.cfg
-    else
-      echo "  - Re-defined local password of Telnet allowed device '${TELNETALLOWEDDEV}' to global password"
-      sed -i "s,attr ${TELNETALLOWEDDEV} password,attr ${TELNETALLOWEDDEV} globalpassword," ${FHEM_DIR}/fhem.cfg
+    ## Enforce local telnet access w/o password
+    if [ -n "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P "^attr ${TELNETALLOWEDDEV} password.*")" ]; then
+      if [ -n "$(cat ${FHEM_DIR}/${CONFIGTYPE} | grep -P "^attr ${TELNETALLOWEDDEV} globalpassword.*")" ]; then
+        echo "  - Removed local password from Telnet allowed device '${TELNETALLOWEDDEV}'"
+        sed -i "/attr ${TELNETALLOWEDDEV} password/d" ${FHEM_DIR}/${CONFIGTYPE}
+      else
+        echo "  - Re-defined local password of Telnet allowed device '${TELNETALLOWEDDEV}' to global password"
+        sed -i "s,attr ${TELNETALLOWEDDEV} password,attr ${TELNETALLOWEDDEV} globalpassword," ${FHEM_DIR}/${CONFIGTYPE}
+      fi
     fi
-  fi
 
-  # Optional
-  sed -i "s,attr global dnsServer.*,attr global dnsServer ${DNS}," ${FHEM_DIR}/fhem.cfg
+    # Optional
+    sed -i "s,attr global dnsServer.*,attr global dnsServer ${DNS}," ${FHEM_DIR}/${CONFIGTYPE}
+  fi
 
   echo 'Starting FHEM ...'
   trap "StopFHEM" SIGTERM
